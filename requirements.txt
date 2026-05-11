@@ -1,0 +1,10 @@
+streamlit>=1.33
+pillow>=10.0
+numpy>=1.26
+torch
+torchvision
+torchaudio
+transformers
+faiss-cpu
+ultralytics
+accelerate

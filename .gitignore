@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual Environments
+venv/
+.venv/
+env/
+.env
+
+# Streamlit
+.streamlit/
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# Data & Models
+data/
+*.pth
+*.pt
+*.npy
+*.index
+*.csv
+
+# Datasets
+DeepFashion/
+Img/
