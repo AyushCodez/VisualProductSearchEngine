@@ -32,7 +32,7 @@ import streamlit as st
 from PIL import Image, ImageDraw
 import torch
 from ultralytics import YOLO
-from transformers import CLIPProcessor, CLIPModel, BlipProcessor, BlipForConditionalGeneration
+from transformers import CLIPProcessor, CLIPModel, BlipProcessor, BlipForImageTextRetrieval
 import faiss
 import os
 
@@ -91,25 +91,26 @@ def load_retrieval_models():
     
     clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
     
-    # Load BLIP
-    blip_processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-large")
-    blip_model = BlipForConditionalGeneration.from_pretrained(
-        "Salesforce/blip-image-captioning-large", torch_dtype=torch.float16 if device == "cuda" else torch.float32
+    # Load BLIP ITM
+    blip_itm_processor = BlipProcessor.from_pretrained("Salesforce/blip-itm-base-coco")
+    blip_itm_model = BlipForImageTextRetrieval.from_pretrained(
+        "Salesforce/blip-itm-base-coco", torch_dtype=torch.float16 if device == "cuda" else torch.float32
     ).to(device)
-    blip_model.eval()
+    blip_itm_model.eval()
     
-    return clip_model, clip_processor, blip_model, blip_processor, device
+    return clip_model, clip_processor, blip_itm_model, blip_itm_processor, device
 
 @st.cache_resource
 def load_retrieval_data():
-    index = faiss.read_index("data/optimized_fusion_faiss.index")
+    index = faiss.read_index("data/optimized_fusion_hnsw_faiss.index")
     gallery_paths = np.load("data/gallery_paths.npy", allow_pickle=True)
     gallery_item_ids = np.load("data/gallery_item_ids.npy", allow_pickle=True)
-    return index, gallery_paths, gallery_item_ids
+    gallery_captions = np.load("data/gallery_captions.npy", allow_pickle=True)
+    return index, gallery_paths, gallery_item_ids, gallery_captions
 
 yolo_model = load_yolo_model()
-clip_model, clip_processor, blip_model, blip_processor, device = load_retrieval_models()
-fusion_index, gallery_paths, gallery_item_ids = load_retrieval_data()
+clip_model, clip_processor, blip_itm_model, blip_itm_processor, device = load_retrieval_models()
+fusion_index, gallery_paths, gallery_item_ids, gallery_captions = load_retrieval_data()
 
 # ------------------------------------------------------------------
 # Models
@@ -170,67 +171,63 @@ class SearchResult:
 
 def run_visual_search(crop: Image.Image, top_k: int = 8) -> List[SearchResult]:
     """
-    Real multimodal retrieval pipeline.
+    Real multimodal retrieval pipeline with ITM re-ranking.
     """
-    # 1. CLIP Image Embedding
+    # 1. CLIP Image Embedding (Query is only image)
     inputs = clip_processor(images=crop, return_tensors="pt").to(device)
     with torch.no_grad():
         vision_outputs = clip_model.vision_model(pixel_values=inputs["pixel_values"])
         image_features = clip_model.visual_projection(vision_outputs.pooler_output)
     image_features = image_features / torch.norm(image_features, dim=-1, keepdim=True)
-    image_emb = image_features.cpu().numpy()[0]
+    query_emb = image_features.cpu().numpy()[0].astype(np.float32).reshape(1, -1)
     
-    # 2. BLIP Caption Generation
-    inputs_blip = blip_processor(images=crop, return_tensors="pt").to(
-        device, torch.float16 if device == "cuda" else torch.float32
-    )
-    with torch.no_grad():
-        generated_ids = blip_model.generate(**inputs_blip, max_new_tokens=30)
-    caption = blip_processor.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
+    # 2. Candidate Retrieval (fetch top-15 from FAISS)
+    search_k = 15
+    scores, indices = fusion_index.search(query_emb, search_k)
     
-    # 3. CLIP Text Embedding
-    inputs_text = clip_processor.tokenizer(
-        caption, return_tensors="pt", padding=True, truncation=True
-    ).to(device)
-    with torch.no_grad():
-        text_outputs = clip_model.text_model(
-            input_ids=inputs_text["input_ids"], attention_mask=inputs_text["attention_mask"]
-        )
-        text_features = clip_model.text_projection(text_outputs.pooler_output)
-    text_features = text_features / torch.norm(text_features, dim=-1, keepdim=True)
-    text_emb = text_features.cpu().numpy()[0]
-    
-    # 4. Fusion Embedding
-    alpha, beta = 0.7, 0.3
-    fusion_emb = alpha * image_emb + beta * text_emb
-    fusion_emb = fusion_emb / np.linalg.norm(fusion_emb)
-    fusion_emb = fusion_emb.astype(np.float32).reshape(1, -1)
-    
-    # 5. FAISS Search
-    scores, indices = fusion_index.search(fusion_emb, top_k)
-    
-    # 6. Build Results
-    results = []
-    for i in range(top_k):
+    candidates = []
+    for i in range(search_k):
         idx = indices[0][i]
-        score = scores[0][i]
-        item_id = gallery_item_ids[idx]
-        # Paths are like 'img/WOMEN/...'. We map to 'Img/img/WOMEN/...'
-        rel_path = gallery_paths[idx]
-        full_path = os.path.join("Img", rel_path)
+        faiss_score = scores[0][i]
+        candidates.append({
+            "idx": idx,
+            "faiss_score": float(faiss_score),
+            "item_id": gallery_item_ids[idx],
+            "rel_path": gallery_paths[idx],
+            "caption": str(gallery_captions[idx])
+        })
+        
+    # 3. Semantic Re-ranking (BLIP ITM)
+    for cand in candidates:
+        itm_inputs = blip_itm_processor(images=crop, text=cand["caption"], return_tensors="pt").to(
+            device, torch.float16 if device == "cuda" else torch.float32
+        )
+        with torch.no_grad():
+            itm_scores = blip_itm_model(**itm_inputs)[0]
+            # itm_scores usually outputs logits for [negative, positive]
+            itm_prob = torch.nn.functional.softmax(itm_scores, dim=1)[0][1].item()
+        cand["itm_score"] = itm_prob
+        
+    # Sort candidates by ITM score descending
+    candidates.sort(key=lambda x: x["itm_score"], reverse=True)
+    
+    # 4. Build Final Top-K Results
+    results = []
+    for i in range(min(top_k, len(candidates))):
+        cand = candidates[i]
+        full_path = os.path.join("Img", cand["rel_path"])
         
         try:
             res_image = Image.open(full_path).convert("RGB")
         except Exception:
-            # Fallback if image not found
             res_image = Image.new("RGB", (256, 256), color=(200, 200, 200))
             
         results.append(SearchResult(
-            product_id=item_id,
-            title=caption.title() if i == 0 else f"Similar to: {caption[:15]}...",
-            category=rel_path.split("/")[1] if "/" in rel_path else "Unknown",
-            price=f"${random.randint(15, 250)}.99",  # Mock price
-            score=float(score),
+            product_id=cand["item_id"],
+            title=cand["caption"].title()[:40] + "...",
+            category=cand["rel_path"].split("/")[1] if "/" in cand["rel_path"] else "Unknown",
+            price=f"${random.randint(15, 250)}.99",
+            score=cand["itm_score"],
             image=res_image,
         ))
         
